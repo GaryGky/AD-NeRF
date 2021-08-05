@@ -43,19 +43,17 @@ def load_audface_data(basedir, testskip=1, test_file=None, aud_file=None):
         auds = []
         sample_rects = []
         mouth_rects = []
-        #exps = []
+        # exps = []
         if s == 'train' or testskip == 0:
             skip = 1
         else:
             skip = testskip
 
         for frame in meta['frames'][::skip]:
-            fname = os.path.join(basedir, 'head_imgs',
-                                 str(frame['img_id']) + '.jpg')
+            fname = os.path.join(basedir, 'head_imgs', str(frame['img_id']) + '.jpg')
             imgs.append(fname)
             poses.append(np.array(frame['transform_matrix']))
-            auds.append(
-                aud_features[min(frame['aud_id'], aud_features.shape[0]-1)])
+            auds.append(aud_features[min(frame['aud_id'], aud_features.shape[0] - 1)])
             sample_rects.append(np.array(frame['face_rect'], dtype=np.int32))
         imgs = np.array(imgs)
         poses = np.array(poses).astype(np.float32)
@@ -66,7 +64,7 @@ def load_audface_data(basedir, testskip=1, test_file=None, aud_file=None):
         all_auds.append(auds)
         all_sample_rects.append(sample_rects)
 
-    i_split = [np.arange(counts[i], counts[i+1]) for i in range(len(splits))]
+    i_split = [np.arange(counts[i], counts[i + 1]) for i in range(len(splits))]
     imgs = np.concatenate(all_imgs, 0)
     poses = np.concatenate(all_poses, 0)
     auds = np.concatenate(all_auds, 0)
@@ -79,3 +77,9 @@ def load_audface_data(basedir, testskip=1, test_file=None, aud_file=None):
         meta['cx']), float(meta['cy'])
 
     return imgs, poses, auds, bc_img, [H, W, focal, cx, cy], sample_rects, sample_rects, i_split
+
+
+if __name__ == '__main__':
+    datadir = '/mnt/cpfs/users/gpuwork/zheng.zhu/talking-head-code/AD-NeRF/dataset/Obama/'
+    imgs, _, _, _, _, _, _, _ = load_audface_data(datadir, aud_file='aud.npy')
+    print(imgs.shape)

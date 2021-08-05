@@ -11,7 +11,7 @@ from run_nerf_helpers import *
 
 os.environ['CUDA_VISIBLE_DEVICES'] = '0,1,2,3,4,5,6,7'
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+device = torch.device("cuda:5" if torch.cuda.is_available() else "cpu")
 np.random.seed(0)
 
 logger = logging.getLogger('adnerf')
@@ -36,7 +36,7 @@ def batchify(fn, chunk):
 def run_network(inputs, viewdirs, aud_para, fn, embed_fn, embeddirs_fn, netchunk=1024 * 64):
     """Prepares inputs and applies network 'fn'.
     """
-    inputs_flat = torch.reshape(inputs, [-1, inputs.shape[-1]])
+    inputs_flat = torch.reshape(inputs, [-1, inputs.shape[-1]]).to(device)
     embedded = embed_fn(inputs_flat)
     aud = aud_para.unsqueeze(0).expand(inputs_flat.shape[0], -1)
     # embed直接concat了音频特征
@@ -460,6 +460,8 @@ def render_rays(ray_batch,
             t_rand = torch.Tensor(t_rand).to(lower.device)
         t_rand[..., -1] = 1.0
         z_vals = lower + (upper - lower) * t_rand
+        z_vals.to(device)
+        viewdirs.to(device)
     pts = rays_o[..., None, :] + rays_d[..., None, :] * \
           z_vals[..., :, None]  # [N_rays, N_samples, 3]
     raw = network_query_fn(pts, viewdirs, aud_para, network_fn)
@@ -510,13 +512,11 @@ def train():
 
     if args.dataset_type == 'audface':
         if args.with_test == 1:
-            poses, auds, bc_img, hwfcxy = \
-                load_audface_data(args.datadir, args.testskip,
-                                  args.test_file, args.aud_file)
+            poses, auds, bc_img, hwfcxy = load_audface_data(args.datadir, args.testskip, args.test_file, args.aud_file)
             images = np.zeros(1)
         else:
-            images, poses, auds, bc_img, hwfcxy, sample_rects, mouth_rects, i_split = load_audface_data(
-                args.datadir, args.testskip)
+            images, poses, auds, bc_img, hwfcxy, sample_rects, mouth_rects, i_split = load_audface_data(args.datadir,
+                                                                                                        args.testskip)
         logger.info(f'Loaded audface: images_shape: {images.shape} || hwfcxy: {hwfcxy} || datadir: {args.datadir}')
         if args.with_test == 0:
             i_train, i_val = i_split
@@ -658,8 +658,7 @@ def train():
         else:
             # Random from one image
             img_i = np.random.choice(i_train)
-            target = torch.as_tensor(imageio.imread(
-                images[img_i])).to(device).float() / 255.0
+            target = torch.as_tensor(imageio.imread(images[img_i])).to(device).float() / 255.0
             pose = poses[img_i, :3, :4]
             rect = sample_rects[img_i]
             mouth_rect = mouth_rects[img_i]
@@ -759,7 +758,6 @@ def train():
         optimizer_Aud.zero_grad()
         optimizer_AudAtt.zero_grad()
         img_loss = img2mse(rgb, target_s)
-        trans = extras['raw'][..., -1]
         loss = img_loss
         psnr = mse2psnr(img_loss)
 

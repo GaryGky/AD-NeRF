@@ -4,7 +4,7 @@ import torch.nn as nn
 import torch
 
 torch.autograd.set_detect_anomaly(True)
-device = torch.device("cuda")
+device = torch.device("cuda:5")
 
 
 # TODO: remove this dependency
@@ -12,7 +12,7 @@ device = torch.device("cuda")
 def img2mse(x, y): return torch.mean((x - y) ** 2)
 
 
-def mse2psnr(x): return -10. * torch.log(x) / torch.log(torch.Tensor([10.]))
+def mse2psnr(x): return -10. * torch.log(x) / torch.log(torch.Tensor([10.]).to(device))
 
 
 def to8b(x): return (255 * np.clip(x, 0, 1)).astype(np.uint8)
@@ -42,7 +42,7 @@ class Embedder:
 
         for freq in freq_bands:
             for p_fn in self.kwargs['periodic_fns']:
-                embed_fns.append(lambda x, p_fn=p_fn, freq=freq: p_fn(x * freq))
+                embed_fns.append(lambda x, p_fn=p_fn, freq=freq: p_fn(x.to(device) * freq.to(device)))
                 out_dim += d
 
         self.embed_fns = embed_fns
@@ -502,7 +502,7 @@ def config_parser():
                         help='layers in fine network')
     parser.add_argument("--netwidth_fine", type=int, default=256,
                         help='channels per layer in fine network')
-    parser.add_argument("--N_rand", type=int, default=2048,
+    parser.add_argument("--N_rand", type=int, default=1024,
                         help='batch size (number of random rays per gradient step)')
     parser.add_argument("--lrate", type=float, default=5e-4,
                         help='learning rate')
