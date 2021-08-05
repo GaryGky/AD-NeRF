@@ -1,32 +1,24 @@
+import os
+
+import numpy as np
 import torch
 import torch.nn as nn
-import numpy as np
-import os
-from pytorch3d.structures import Meshes
 from pytorch3d.renderer import (
     look_at_view_transform,
-    PerspectiveCameras,
     FoVPerspectiveCameras,
     PointLights,
-    DirectionalLights,
     Materials,
     RasterizationSettings,
     MeshRenderer,
     MeshRasterizer,
-    SoftPhongShader,
-    TexturesUV,
     TexturesVertex,
     blending
 )
-
-from pytorch3d.ops import interpolate_face_attributes
-
 from pytorch3d.renderer.blending import (
     BlendParams,
-    hard_rgb_blend,
-    sigmoid_alpha_blend,
     softmax_rgb_blend,
 )
+from pytorch3d.structures import Meshes
 
 
 class SoftSimpleShader(nn.Module):
@@ -41,7 +33,7 @@ class SoftSimpleShader(nn.Module):
     """
 
     def __init__(
-        self, device="cpu", cameras=None, lights=None, materials=None, blend_params=None
+            self, device="cuda:0", cameras=None, lights=None, materials=None, blend_params=None
     ):
         super().__init__()
         self.lights = lights if lights is not None else PointLights(
@@ -60,7 +52,6 @@ class SoftSimpleShader(nn.Module):
         return self
 
     def forward(self, fragments, meshes, **kwargs) -> torch.Tensor:
-
         texels = meshes.sample_textures(fragments)
         blend_params = kwargs.get("blend_params", self.blend_params)
 
@@ -69,11 +60,9 @@ class SoftSimpleShader(nn.Module):
             msg = "Cameras must be specified either at initialization \
                 or in the forward pass of SoftPhongShader"
             raise ValueError(msg)
-        znear = kwargs.get("znear", getattr(cameras, "znear", 1.0))
-        zfar = kwargs.get("zfar", getattr(cameras, "zfar", 100.0))
-        images = softmax_rgb_blend(
-            texels, fragments, blend_params, znear=znear, zfar=zfar
-        )
+        znear = 0.01
+        zfar = 20
+        images = softmax_rgb_blend(texels, fragments, blend_params, znear=znear, zfar=zfar)
         return images
 
 
@@ -98,7 +87,7 @@ class Render_3DMM(nn.Module):
         vert_1 = torch.index_select(geometry, 1, self.tris[:, 0])
         vert_2 = torch.index_select(geometry, 1, self.tris[:, 1])
         vert_3 = torch.index_select(geometry, 1, self.tris[:, 2])
-        nnorm = torch.cross(vert_2-vert_1, vert_3-vert_1, 2)
+        nnorm = torch.cross(vert_2 - vert_1, vert_3 - vert_1, 2)
         tri_normal = nn.functional.normalize(nnorm, dim=2)
         v_norm = tri_normal[:, self.vert_tris, :].sum(2)
         vert_normal = v_norm / v_norm.norm(dim=2).unsqueeze(2)
@@ -111,7 +100,7 @@ class Render_3DMM(nn.Module):
         T = torch.zeros((batch_size, 3), dtype=torch.float32).to(self.device)
 
         cameras = FoVPerspectiveCameras(device=self.device, R=R, T=T, znear=0.01, zfar=20,
-                                        fov=2*np.arctan(self.img_w//2/self.focal)*180./np.pi)
+                                        fov=2 * np.arctan(self.img_w // 2 / self.focal) * 180. / np.pi)
         lights = PointLights(
             device=self.device,
             location=[[0.0, 0.0, 1e5]],
@@ -122,7 +111,7 @@ class Render_3DMM(nn.Module):
         sigma = 1e-4
         raster_settings = RasterizationSettings(
             image_size=(self.img_h, self.img_w),
-            blur_radius=np.log(1. / 1e-4 - 1.)*sigma / 18.0,
+            blur_radius=np.log(1. / 1e-4 - 1.) * sigma / 18.0,
             faces_per_pixel=2,
             perspective_correct=False,
         )
@@ -133,6 +122,7 @@ class Render_3DMM(nn.Module):
                 cameras=cameras
             ),
             shader=SoftSimpleShader(
+                device=self.device,
                 lights=lights,
                 blend_params=blend_params,
                 cameras=cameras
@@ -142,7 +132,6 @@ class Render_3DMM(nn.Module):
 
     @staticmethod
     def Illumination_layer(face_texture, norm, gamma):
-
         n_b, num_vertex, _ = face_texture.size()
         n_v_full = n_b * num_vertex
         gamma = gamma.view(-1, 3, 9).clone()

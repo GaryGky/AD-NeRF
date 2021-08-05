@@ -15,15 +15,15 @@ import cv2
 
 from run_nerf_helpers import *
 
-device = torch.device('cuda', 0)
-device_torso = torch.device('cuda', 0)
+device = torch.device('cuda', 7)
+device_torso = torch.device('cuda', 7)
 np.random.seed(0)
 DEBUG = False
 
 
 def rot_to_euler(R):
     batch_size, _, _ = R.shape
-    e = torch.ones((batch_size, 3)).cuda()
+    e = torch.ones((batch_size, 3)).to(device)
 
     R00 = R[:, 0, 0]
     R01 = R[:, 0, 1]

@@ -6,7 +6,7 @@ from util import *
 
 
 class Face_3DMM(nn.Module):
-    def __init__(self, modelpath, id_dim, exp_dim, tex_dim, point_num):
+    def __init__(self, modelpath, id_dim, exp_dim, tex_dim, point_num,cuda_num=0):
         super(Face_3DMM, self).__init__()
         # id_dim = 100
         # exp_dim = 79
@@ -23,27 +23,27 @@ class Face_3DMM(nn.Module):
         for i in range(3):
             mu[:, i] -= np.mean(mu[:, i])
         mu = mu.reshape(-1)
-        self.base_id = torch.as_tensor(base_id).cuda()/100000.0
-        self.base_exp = torch.as_tensor(base_exp).cuda()/100000.0
-        self.mu = torch.as_tensor(mu).cuda()/100000.0
+        self.base_id = torch.as_tensor(base_id).cuda(cuda_num)/100000.0
+        self.base_exp = torch.as_tensor(base_exp).cuda(cuda_num)/100000.0
+        self.mu = torch.as_tensor(mu).cuda(cuda_num)/100000.0
         base_tex = DMM_info['b_tex'][:tex_dim, :]
         mu_tex = DMM_info['mu_tex']
-        self.base_tex = torch.as_tensor(base_tex).cuda()
-        self.mu_tex = torch.as_tensor(mu_tex).cuda()
+        self.base_tex = torch.as_tensor(base_tex).cuda(cuda_num)
+        self.mu_tex = torch.as_tensor(mu_tex).cuda(cuda_num)
         sig_id = DMM_info['sig_shape'][:id_dim]
         sig_tex = DMM_info['sig_tex'][:tex_dim]
         sig_exp = DMM_info['sig_exp'][:exp_dim]
-        self.sig_id = torch.as_tensor(sig_id).cuda()
-        self.sig_tex = torch.as_tensor(sig_tex).cuda()
-        self.sig_exp = torch.as_tensor(sig_exp).cuda()
+        self.sig_id = torch.as_tensor(sig_id).cuda(cuda_num)
+        self.sig_tex = torch.as_tensor(sig_tex).cuda(cuda_num)
+        self.sig_exp = torch.as_tensor(sig_exp).cuda(cuda_num)
 
         keys_info = np.load(os.path.join(
             modelpath, 'keys_info.npy'), allow_pickle=True).item()
-        self.keyinds = torch.as_tensor(keys_info['keyinds']).cuda()
-        self.left_contours = torch.as_tensor(keys_info['left_contour']).cuda()
+        self.keyinds = torch.as_tensor(keys_info['keyinds']).cuda(cuda_num)
+        self.left_contours = torch.as_tensor(keys_info['left_contour']).cuda(cuda_num)
         self.right_contours = torch.as_tensor(
-            keys_info['right_contour']).cuda()
-        self.rigid_ids = torch.as_tensor(keys_info['rigid_ids']).cuda()
+            keys_info['right_contour']).cuda(cuda_num)
+        self.rigid_ids = torch.as_tensor(keys_info['rigid_ids']).cuda(cuda_num)
 
     def get_3dlandmarks(self, id_para, exp_para, euler_angle, trans, focal_length, cxy):
         id_para = id_para*self.sig_id
@@ -58,8 +58,7 @@ class Face_3DMM(nn.Module):
             torch.mm(exp_para, self.base_exp[:,
                      sel_index]) + self.mu[sel_index]
         left_geometry = left_geometry.view(batch_size, -1, 3)
-        proj_x = forward_transform(
-            left_geometry, euler_angle, trans, focal_length, cxy)[:, :, 0]
+        proj_x = forward_transform(            left_geometry, euler_angle, trans, focal_length, cxy)[:, :, 0]
         proj_x = proj_x.reshape(batch_size, 8, num_per_contour)
         arg_min = proj_x.argmin(dim=2)
         left_geometry = left_geometry.view(batch_size*8, num_per_contour, 3)

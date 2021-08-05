@@ -9,7 +9,6 @@ import zipfile
 import logging
 import hashlib
 
-
 deepspeech_features_repo_url = 'https://github.com/osmr/deepspeech_features'
 
 
@@ -44,13 +43,16 @@ def get_deepspeech_model_file(local_model_store_dir_path=os.path.join("~", ".ten
         os.makedirs(local_model_store_dir_path)
 
     zip_file_path = file_path + ".zip"
-    _download(
-        url="{repo_url}/releases/download/{repo_release_tag}/{file_name}.zip".format(
-            repo_url=deepspeech_features_repo_url,
-            repo_release_tag="v0.0.1",
-            file_name=file_name),
-        path=zip_file_path,
-        overwrite=True)
+
+    # 如果不存在的话，才去网上拉
+    if not os.path.exists(zip_file_path):
+        _download(
+            url="{repo_url}/releases/download/{repo_release_tag}/{file_name}.zip".format(
+                repo_url=deepspeech_features_repo_url,
+                repo_release_tag="v0.0.1",
+                file_name=file_name),
+            path=zip_file_path,
+            overwrite=True)
     with zipfile.ZipFile(zip_file_path) as zf:
         zf.extractall(local_model_store_dir_path)
     os.remove(zip_file_path)
@@ -93,6 +95,7 @@ def _download(url, path=None, overwrite=False, sha1_hash=None, retries=5, verify
     except ImportError:
         class requests_failed_to_import(object):
             pass
+
         requests = requests_failed_to_import
 
     if path is None:

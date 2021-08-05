@@ -16,6 +16,7 @@ from pathlib import Path
 import configargparse
 
 
+# 把神经网络分离出的人脸进行可视化和持久化
 def vis_parsing_maps(im, parsing_anno, stride, save_im=False, save_path='vis_results/parsing_map_on_im.jpg',
                      img_size=(512, 512)):
     im = np.array(im)
@@ -43,7 +44,6 @@ def vis_parsing_maps(im, parsing_anno, stride, save_im=False, save_path='vis_res
         vis_parsing_anno_color[index[0], index[1], :] = np.array([255, 0, 0])
 
     vis_parsing_anno_color = vis_parsing_anno_color.astype(np.uint8)
-    index = np.where(vis_parsing_anno == num_of_class-1)
     vis_im = cv2.resize(vis_parsing_anno_color, img_size,
                         interpolation=cv2.INTER_NEAREST)
     if save_im:
@@ -75,7 +75,9 @@ def evaluate(respth='./res/test_res', dspth='./data', cp='model_final_diss.pth')
                 img = to_tensor(image)
                 img = torch.unsqueeze(img, 0)
                 img = img.cuda()
+                # 神经网络输出 out
                 out = net(img)[0]
+                # 从out中解析出parsing
                 parsing = out.squeeze(0).cpu().numpy().argmax(0)
                 image_path = int(image_path[:-4])
                 image_path = str(image_path) + '.png'
