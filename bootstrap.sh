@@ -7,3 +7,6 @@ pip install -r requirement.txt
 
 # 运行命令
 python ./NeRFs/HeadNeRF/run_nerf.py --config dataset/Obama/HeadNeRF_config.txt
+
+# Torso train
+python ./NeRFs/TorsoNeRF/run_nerf.py --config dataset/Obama/TorsoNeRF_config.txt

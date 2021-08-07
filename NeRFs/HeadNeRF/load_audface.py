@@ -76,10 +76,11 @@ def load_audface_data(basedir, testskip=1, test_file=None, aud_file=None):
     focal, cx, cy = float(meta['focal_len']), float(
         meta['cx']), float(meta['cy'])
 
-    return imgs, poses, auds, bc_img, [H, W, focal, cx, cy], sample_rects, sample_rects, i_split
+    return imgs, poses, auds, bc_img, [H, W, focal, cx, cy], sample_rects, mouth_rects, i_split
 
 
 if __name__ == '__main__':
     datadir = '/mnt/cpfs/users/gpuwork/zheng.zhu/talking-head-code/AD-NeRF/dataset/Obama/'
-    imgs, _, _, _, _, _, _, _ = load_audface_data(datadir, aud_file='aud.npy')
+    imgs, poses, auds, bc_img, [H, W, focal, cx, cy], sample_rects, sample_rects, i_split = load_audface_data(datadir,
+                                                                                                              aud_file='aud.npy')
     print(imgs.shape)

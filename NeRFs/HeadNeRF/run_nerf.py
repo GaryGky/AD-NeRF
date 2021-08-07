@@ -601,8 +601,6 @@ def train():
             imageio.mimwrite(os.path.join(testsavedir, 'video.mp4'), to8b(rgbs), fps=30, quality=8)
             return
 
-    num_frames = images.shape[0]
-
     # Prepare raybatch tensor if batching random rays
     N_rand = args.N_rand
     logger.info(f'N_rand: {N_rand} , no_batching: {args.no_batching}, sample_rate {args.sample_rate}')
@@ -629,7 +627,6 @@ def train():
         logger.info('done')
         i_batch = 0
 
-    if use_batching:
         rays_rgb = torch.Tensor(rays_rgb).to(device)
 
     N_iters = args.N_iters + 1
@@ -658,12 +655,14 @@ def train():
         else:
             # Random from one image
             img_i = np.random.choice(i_train)
+            # 目标图像
             target = torch.as_tensor(imageio.imread(images[img_i])).to(device).float() / 255.0
             pose = poses[img_i, :3, :4]
             rect = sample_rects[img_i]
-            mouth_rect = mouth_rects[img_i]
+            # mouth_rect = mouth_rects[img_i]
             aud = auds[img_i]
             if global_step >= args.nosmo_iters:
+                # args.smo_size=8
                 smo_half_win = int(args.smo_size / 2)
                 left_i = img_i - smo_half_win
                 right_i = img_i + smo_half_win
@@ -701,9 +700,9 @@ def train():
                         logger.info(
                             f"[Config] Center cropping of size {2 * dH} x {2 * dW} is enabled until iter {args.precrop_iters}")
                 else:
-                    # 少选一些点 不然内存不够
+                    # 这里给出了选点的范围 - 整张图片
                     coords = torch.stack(
-                        torch.meshgrid(torch.linspace(0, H - 1, H // 2), torch.linspace(0, W - 1, W // 2)),
+                        torch.meshgrid(torch.linspace(0, H - 1, H), torch.linspace(0, W - 1, W)),
                         -1)  # (H, W, 2)
 
                 coords = torch.reshape(coords, [-1, 2])  # (H * W, 2)
@@ -720,8 +719,8 @@ def train():
                         coords_rect.shape[0], size=[rect_num], replace=False)  # (N_rand,)
                     # (N_rand, 2)
                     select_coords_rect = coords_rect[select_inds_rect].long()
-                    select_inds_norect = np.random.choice(
-                        coords_norect.shape[0], size=[norect_num], replace=False)  # (N_rand,)
+                    select_inds_norect = np.random.choice(coords_norect.shape[0], size=[norect_num],
+                                                          replace=False)  # (N_rand,)
                     # (N_rand, 2)
                     select_coords_norect = coords_norect[select_inds_norect].long(
                     )
@@ -811,13 +810,11 @@ def train():
             auds_val = AudNet(auds[i_val])
             with torch.no_grad():
                 render_path(torch.Tensor(poses[i_val]).to(device), auds_val, bc_img, hwfcxy, args.chunk,
-                            render_kwargs_test, gt_imgs=None,
-                            savedir=testsavedir)
+                            render_kwargs_test, gt_imgs=None, savedir=testsavedir)
             logger.info('Saved test set')
 
         if i % args.i_print == 0:
-            tqdm.write(
-                f"[TRAIN] Iter: {i} Loss: {loss.item()}  PSNR: {psnr.item()}")
+            tqdm.write(f"[TRAIN] Iter: {i} Loss: {loss.item()}  PSNR: {psnr.item()}")
         global_step += 1
 
 

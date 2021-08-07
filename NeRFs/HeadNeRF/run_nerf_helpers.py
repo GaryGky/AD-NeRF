@@ -116,17 +116,13 @@ class AudioNet(nn.Module):
         self.win_size = win_size
         self.dim_aud = dim_aud
         self.encoder_conv = nn.Sequential(  # n x 29 x 16
-            nn.Conv1d(29, 32, kernel_size=3, stride=2,
-                      padding=1, bias=True),  # n x 32 x 8
+            nn.Conv1d(29, 32, kernel_size=3, stride=2, padding=1, bias=True),  # n x 32 x 8
             nn.LeakyReLU(0.02, True),
-            nn.Conv1d(32, 32, kernel_size=3, stride=2,
-                      padding=1, bias=True),  # n x 32 x 4
+            nn.Conv1d(32, 32, kernel_size=3, stride=2, padding=1, bias=True),  # n x 32 x 4
             nn.LeakyReLU(0.02, True),
-            nn.Conv1d(32, 64, kernel_size=3, stride=2,
-                      padding=1, bias=True),  # n x 64 x 2
+            nn.Conv1d(32, 64, kernel_size=3, stride=2, padding=1, bias=True),  # n x 64 x 2
             nn.LeakyReLU(0.02, True),
-            nn.Conv1d(64, 64, kernel_size=3, stride=2,
-                      padding=1, bias=True),  # n x 64 x 1
+            nn.Conv1d(64, 64, kernel_size=3, stride=2, padding=1, bias=True),  # n x 64 x 1
             nn.LeakyReLU(0.02, True),
         )
         self.encoder_fc1 = nn.Sequential(
@@ -502,15 +498,15 @@ def config_parser():
                         help='layers in fine network')
     parser.add_argument("--netwidth_fine", type=int, default=256,
                         help='channels per layer in fine network')
-    parser.add_argument("--N_rand", type=int, default=1024,
+    parser.add_argument("--N_rand", type=int, default=2048,
                         help='batch size (number of random rays per gradient step)')
     parser.add_argument("--lrate", type=float, default=5e-4,
                         help='learning rate')
     parser.add_argument("--lrate_decay", type=int, default=500,
                         help='exponential learning rate decay (in 1000 steps)')
-    parser.add_argument("--chunk", type=int, default=64,
+    parser.add_argument("--chunk", type=int, default=1024,
                         help='number of rays processed in parallel, decrease if running out of memory')
-    parser.add_argument("--netchunk", type=int, default=64 * 64,
+    parser.add_argument("--netchunk", type=int, default=1024 * 64,
                         help='number of pts sent through network in parallel, decrease if running out of memory')
     parser.add_argument("--no_batching", action='store_false',
                         help='only take random rays from 1 image at a time')
@@ -518,7 +514,7 @@ def config_parser():
                         help='do not reload weights from saved ckpt')
     parser.add_argument("--ft_path", type=str, default=None,
                         help='specific weights npy file to reload for coarse network')
-    parser.add_argument("--N_iters", type=int, default=150000,
+    parser.add_argument("--N_iters", type=int, default=400000,
                         help='number of iterations')
 
     # rendering options

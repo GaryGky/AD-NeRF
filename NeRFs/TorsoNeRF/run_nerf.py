@@ -333,8 +333,8 @@ def create_nerf(args, ext, dim_aud, device_spec=torch.device('cuda', 0), with_au
     if args.ft_path is not None and args.ft_path != 'None':
         ckpts = [args.ft_path]
     else:
-        ckpts = [os.path.join(basedir, expname, f) for f in natsorted(
-            os.listdir(os.path.join(basedir, expname))) if ext in f]
+        ckpts = [os.path.join(basedir, expname, f) for f in natsorted(os.listdir(os.path.join(basedir, expname))) if
+                 ext in f]
 
     logger.info(f'Found ckpts:{ckpts}')
     learned_codes_dict = None
@@ -432,8 +432,7 @@ def raw2outputs(raw, z_vals, rays_d, bc_rgb, raw_noise_std=0, white_bkgd=False, 
     rgb_map_fg = torch.sum(weights[:, :-1, None] * rgb[:, :-1, :], -2)
 
     depth_map = torch.sum(weights * z_vals, -1)
-    disp_map = 1. / torch.max(1e-10 * torch.ones_like(depth_map),
-                              depth_map / torch.sum(weights, -1))
+    disp_map = 1. / torch.max(1e-10 * torch.ones_like(depth_map), depth_map / torch.sum(weights, -1))
     acc_map = torch.sum(weights, -1)
 
     if white_bkgd:
@@ -605,11 +604,11 @@ def train():
             file.write(open(args.config, 'r').read())
 
     # Create nerf model
-    render_kwargs_train, render_kwargs_test, start, grad_vars, optimizer, \
-    learned_codes, AudNet_state, optimizer_aud_state, AudAttNet_state = create_nerf(
+    render_kwargs_train, render_kwargs_test, start, grad_vars, optimizer, learned_codes, AudNet_state, optimizer_aud_state, AudAttNet_state = create_nerf(
         args, 'head.tar', args.dim_aud, device, True)
     global_step = start
 
+    # 创建AudNet
     AudNet = AudioNet(args.dim_aud, args.win_size).to(device)
     AudAttNet = AudioAttNet().to(device)
     optimizer_Aud = torch.optim.Adam(
@@ -664,7 +663,7 @@ def train():
         with torch.no_grad():
             testsavedir = os.path.join(basedir, expname, args.test_save_folder)
             os.makedirs(testsavedir, exist_ok=True)
-            logger.info('test poses shape', poses.shape)
+            logger.info(f'test poses shape:{poses.shape}')
             smo_half_win = int(args.smo_size / 2)
             auds_val = []
             for i in range(poses.shape[0]):
@@ -679,11 +678,9 @@ def train():
                     right_i = poses.shape[0]
                 auds_win = auds[left_i:right_i]
                 if pad_left > 0:
-                    auds_win = torch.cat(
-                        (torch.zeros_like(auds_win)[:pad_left], auds_win), dim=0)
+                    auds_win = torch.cat((torch.zeros_like(auds_win)[:pad_left], auds_win), dim=0)
                 if pad_right > 0:
-                    auds_win = torch.cat(
-                        (auds_win, torch.zeros_like(auds_win)[:pad_right]), dim=0)
+                    auds_win = torch.cat((auds_win, torch.zeros_like(auds_win)[:pad_right]), dim=0)
                 auds_win = AudNet(auds_win)
                 aud_smo = AudAttNet(auds_win)
                 auds_val.append(aud_smo)
@@ -984,8 +981,6 @@ def train():
 
         global_step += 1
 
-
 if __name__ == '__main__':
     torch.set_default_tensor_type('torch.cuda.FloatTensor')
-
     train()
