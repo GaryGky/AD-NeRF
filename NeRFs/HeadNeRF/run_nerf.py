@@ -2,16 +2,26 @@ import logging
 import os
 import time
 
+import face_alignment
 import imageio
+import torch.optim
 from natsort import natsorted
 from tqdm import tqdm, trange
 
 from load_audface import load_audface_data
+from models.attsets import AttentionSets
+from models.audio_net import AudioNet, AudioAttNet
+from models.face_nerf import FaceNeRF
+from models.face_unet import FaceUNetCNN
+from models.nerf_attention_model import NeRFAttentionModel
 from run_nerf_helpers import *
 
 os.environ['CUDA_VISIBLE_DEVICES'] = '0,1,2,3,4,5,6,7'
 
-device = torch.device("cuda:5" if torch.cuda.is_available() else "cpu")
+parser = config_parser()
+args = parser.parse_args()
+
+device = torch.device(f"cuda:{args.gpu}")
 np.random.seed(0)
 
 logger = logging.getLogger('adnerf')
@@ -21,35 +31,26 @@ logger.setLevel(logging.DEBUG)
 logger.info(f"device: {device}")
 
 
-def batchify(fn, chunk):
-    """Constructs a version of 'fn' that applies to smaller batches.
-    """
-    if chunk is None:
-        return fn
-
-    def ret(inputs):
-        return torch.cat([fn(inputs[i:i + chunk]) for i in range(0, inputs.shape[0], chunk)], 0)
-
-    return ret
-
-
-def run_network(inputs, viewdirs, aud_para, fn, embed_fn, embeddirs_fn, netchunk=1024 * 64):
+def run_network(inputs, viewdirs, aud_para, fn, embed_fn, embeddirs_fn,
+                intrisic, cnn_features, attention_poses, netchunk=1024 * 64):
     """Prepares inputs and applies network 'fn'.
     """
     inputs_flat = torch.reshape(inputs, [-1, inputs.shape[-1]]).to(device)
-    embedded = embed_fn(inputs_flat)
+    embeded = embed_fn(inputs_flat)
     aud = aud_para.unsqueeze(0).expand(inputs_flat.shape[0], -1)
     # embed直接concat了音频特征
-    embedded = torch.cat((embedded, aud), -1)
+    embeded = torch.cat((embeded, aud), -1)
     if viewdirs is not None:
         input_dirs = viewdirs[:, None].expand(inputs.shape)
         input_dirs_flat = torch.reshape(input_dirs, [-1, input_dirs.shape[-1]])
-        embedded_dirs = embeddirs_fn(input_dirs_flat)
-        embedded = torch.cat([embedded, embedded_dirs], -1)
+        embeded_dirs = embeddirs_fn(input_dirs_flat)
+        embeded = torch.cat([embeded, embeded_dirs], -1)
 
-    outputs_flat = batchify(fn, netchunk)(embedded)
-    outputs = torch.reshape(outputs_flat, list(
-        inputs.shape[:-1]) + [outputs_flat.shape[-1]])
+    outputs_flat = torch.cat(
+        [fn([embeded[i:i + netchunk], gather_indices(inputs_flat[i:i + netchunk]), attention_poses, intrisic,
+             cnn_features]) for i in
+         range(0, embeded.shape[0], netchunk)], 0)
+    outputs = torch.reshape(outputs_flat, list(inputs.shape[:-1]) + [outputs_flat.shape[-1]])
     return outputs
 
 
@@ -66,6 +67,11 @@ def batchify_rays(rays_flat, bc_rgb, aud_para, chunk=1024 * 32, **kwargs):
 
     all_ret = {k: torch.cat(all_ret[k], 0) for k in all_ret}
     return all_ret
+
+
+"""
+    c2w: pose, 传入了c2w之后，就会在整张图像上render
+"""
 
 
 def render_dynamic_face(H, W, focal, cx, cy, chunk=1024 * 32, rays=None, bc_rgb=None, aud_para=None,
@@ -117,76 +123,6 @@ def render_dynamic_face(H, W, focal, cx, cy, chunk=1024 * 32, rays=None, bc_rgb=
     return ret_list + [ret_dict]
 
 
-def render(H, W, focal, cx, cy, chunk=1024 * 32, rays=None, c2w=None, ndc=True,
-           near=0., far=1.,
-           use_viewdirs=False, c2w_staticcam=None,
-           **kwargs):
-    """Render rays
-    Args:
-      H: int. Height of image in pixels.
-      W: int. Width of image in pixels.
-      focal: float. Focal length of pinhole camera.
-      chunk: int. Maximum number of rays to process simultaneously. Used to
-        control maximum memory usage. Does not affect final results.
-      rays: array of shape [2, batch_size, 3]. Ray origin and direction for
-        each example in batch.
-      c2w: array of shape [3, 4]. Camera-to-world transformation matrix.
-      ndc: bool. If True, represent ray origin, direction in NDC coordinates.
-      near: float or array of shape [batch_size]. Nearest distance for a ray.
-      far: float or array of shape [batch_size]. Farthest distance for a ray.
-      use_viewdirs: bool. If True, use viewing direction of a point in space in model.
-      c2w_staticcam: array of shape [3, 4]. If not None, use this transformation matrix for 
-       camera while using other c2w argument for viewing directions.
-    Returns:
-      rgb_map: [batch_size, 3]. Predicted RGB values for rays.
-      disp_map: [batch_size]. Disparity map. Inverse of depth.
-      acc_map: [batch_size]. Accumulated opacity (alpha) along a ray.
-      extras: dict with everything returned by render_rays().
-    """
-    if c2w is not None:
-        # special case to render full image
-        rays_o, rays_d = get_rays(H, W, focal, c2w, cx, cy)
-    else:
-        # use provided ray batch
-        rays_o, rays_d = rays
-
-    if use_viewdirs:
-        # provide ray directions as input
-        viewdirs = rays_d
-        if c2w_staticcam is not None:
-            # special case to visualize effect of viewdirs
-            rays_o, rays_d = get_rays(H, W, focal, c2w_staticcam, cx, cy)
-        viewdirs = viewdirs / torch.norm(viewdirs, dim=-1, keepdim=True)
-        viewdirs = torch.reshape(viewdirs, [-1, 3]).float()
-
-    sh = rays_d.shape  # [..., 3]
-    if ndc:
-        # for forward facing scenes
-        rays_o, rays_d = ndc_rays(H, W, focal, 1., rays_o, rays_d)
-
-    # Create ray batch
-    rays_o = torch.reshape(rays_o, [-1, 3]).float()
-    rays_d = torch.reshape(rays_d, [-1, 3]).float()
-
-    near, far = near * \
-                torch.ones_like(rays_d[..., :1]), far * \
-                torch.ones_like(rays_d[..., :1])
-    rays = torch.cat([rays_o, rays_d, near, far], -1)
-    if use_viewdirs:
-        rays = torch.cat([rays, viewdirs], -1)
-
-    # Render and reshape
-    all_ret = batchify_rays(rays, chunk, **kwargs)
-    for k in all_ret:
-        k_sh = list(sh[:-1]) + list(all_ret[k].shape[1:])
-        all_ret[k] = torch.reshape(all_ret[k], k_sh)
-
-    k_extract = ['rgb_map', 'disp_map', 'acc_map']
-    ret_list = [all_ret[k] for k in k_extract]
-    ret_dict = {k: all_ret[k] for k in all_ret if k not in k_extract}
-    return ret_list + [ret_dict]
-
-
 def render_path(render_poses, aud_paras, bc_img, hwfcxy,
                 chunk, render_kwargs, gt_imgs=None, savedir=None, render_factor=0):
     H, W, focal, cx, cy = hwfcxy
@@ -206,20 +142,13 @@ def render_path(render_poses, aud_paras, bc_img, hwfcxy,
         logger.info(f'time: {i, time.time() - t}')
         t = time.time()
         rgb, disp, acc, last_weight, _ = render_dynamic_face(
-            H, W, focal, cx, cy, chunk=chunk, c2w=c2w[:3,
-                                                  :4], aud_para=aud_paras[i], bc_rgb=bc_img,
+            H, W, focal, cx, cy, chunk=chunk, c2w=c2w[:3, :4], aud_para=aud_paras[i], bc_rgb=bc_img,
             **render_kwargs)
         rgbs.append(rgb.cpu().numpy())
         disps.append(disp.cpu().numpy())
         last_weights.append(last_weight.cpu().numpy())
         if i == 0:
             logger.info(f'rgb_shape: {rgb.shape}, disp_shape: {disp.shape}')
-
-        """
-        if gt_imgs is not None and render_factor==0:
-            p = -10. * np.log10(np.mean(np.square(rgb.cpu().numpy() - gt_imgs[i])))
-            print(p)
-        """
 
         if savedir is not None:
             rgb8 = to8b(rgbs[-1])
@@ -233,45 +162,67 @@ def render_path(render_poses, aud_paras, bc_img, hwfcxy,
     return rgbs, disps, last_weights
 
 
-def create_nerf(args):
-    """Instantiate NeRF's MLP model.
-    """
-    embed_fn, input_ch = get_embedder(args.multires, args.i_embed)
-
-    input_ch_views = 0
-    embeddirs_fn = None
-    if args.use_viewdirs:
-        embeddirs_fn, input_ch_views = get_embedder(
-            args.multires_views, args.i_embed)
-    output_ch = 5 if args.N_importance > 0 else 4
+def create_model(args):
+    output_ch = 4
     skips = [4]
-    model = FaceNeRF(D=args.netdepth, W=args.netwidth,
-                     input_ch=input_ch, dim_aud=args.dim_aud,
-                     output_ch=output_ch, skips=skips,
-                     input_ch_views=input_ch_views, use_viewdirs=args.use_viewdirs).to(device)
-    grad_vars = list(model.parameters())
-
-    model_fine = None
-    if args.N_importance > 0:
-        model_fine = FaceNeRF(D=args.netdepth_fine, W=args.netwidth_fine,
-                              input_ch=input_ch, dim_aud=args.dim_aud,
-                              output_ch=output_ch, skips=skips,
-                              input_ch_views=input_ch_views, use_viewdirs=args.use_viewdirs).to(device)
-        grad_vars += list(model_fine.parameters())
-
-    def network_query_fn(inputs, viewdirs, aud_para, network_fn):
-        return run_network(inputs, viewdirs, aud_para, network_fn, embed_fn=embed_fn, embeddirs_fn=embeddirs_fn,
-                           netchunk=args.netchunk)
-
-    # Create optimizer
-    optimizer = torch.optim.Adam(
-        params=grad_vars, lr=args.lrate, betas=(0.9, 0.999))
-
     start = 0
     basedir = args.basedir
     expname = args.expname
 
-    ##########################
+    embed_fn, input_ch = get_embedder(args.multires, args.i_embed)
+    embeddirs_fn, input_ch_views = get_embedder(args.multires_views, args.i_embed)
+    """定义网络结构"""
+    # 1. 创建人脸CNN
+    attention_embed_func, attention_embed_out_dim = get_embedder(5, 0)  # embed_out_dim = 33
+    face_unet = FaceUNetCNN(attention_embed_out_dim)
+
+    # 2. 创建AudioNet
+    aud_net = AudioNet(args.dim_aud, args.win_size).to(device)
+    aud_att_net = AudioAttNet().to(device)
+
+    # 3. 创建Attention模型 TODO：这里先使用AttSets，以后可以改为SlotAttention
+    attention_block = AttentionSets(input_ch=128 + attention_embed_out_dim, attention_output_length=512)
+
+    # 4. 创建NeRF
+    face_nerf_coarse = FaceNeRF(D=args.netdepth, W=args.netwidth,
+                                input_ch=input_ch, dim_aud=args.dim_aud,
+                                output_ch=output_ch, skips=skips,
+                                input_ch_views=input_ch_views, use_viewdirs=args.use_viewdirs).to(device)
+
+    # 5. 创建Nerf_Attention模块
+    nerf_attention = NeRFAttentionModel(face_nerf_coarse, attention_block, attention_embed_out_dim)
+    grad_vars = list(nerf_attention.parameters())
+
+    # 6. 创建Nerf_fine_Attention模块
+    _, attention_embed_out_dim_2 = get_embedder(2, 0, 9)
+    face_nerf_fine = FaceNeRF(D=args.netdepth_fine, W=args.netwidth_fine,
+                              input_ch=input_ch, dim_aud=args.dim_aud,
+                              output_ch=output_ch, skips=skips,
+                              input_ch_views=input_ch_views, use_viewdirs=args.use_viewdirs).to(device)
+    nerf_fine_attention = NeRFAttentionModel(face_nerf_fine, attention_block, attention_embed_out_dim_2)
+
+    """统一管理 models"""
+    models = {'nerf_attention_model': nerf_attention}
+    models['face_unet_model'] = face_unet
+    models['aud_model'] = aud_net
+    models['aud_att_model'] = aud_att_net
+    models['nerf_fine_attention_model'] = nerf_fine_attention
+
+    grad_vars += list(nerf_fine_attention.parameters())
+
+    """定义优化器"""
+    # UNet优化器用于优化CNN提取的特征
+    optimizer_unet = torch.optim.Adam(params=face_unet.parameters(), lr=args.lrate, betas=(0.9, 0.999))
+    # nerf的优化器包括coarse和fine两部分
+    optimizer_nerf = torch.optim.Adam(params=grad_vars, lr=args.lrate, betas=(0.9, 0.999))
+    # aud优化器用于优化音频特征的提取
+    optimizer_aud = torch.optim.Adam(params=list(aud_net.parameters()), lr=args.lrate, betas=(0.9, 0.999))
+    optimizer_aud_att = torch.optim.Adam(params=list(aud_att_net.parameters()), lr=args.lrate, betas=(0.9, 0.999))
+    """统一管理优化器"""
+    optimizers = {'optimizer_unet': optimizer_unet}
+    optimizers['optimizer_nerf'] = optimizer_nerf
+    optimizers['optimizer_aud'] = optimizer_aud
+    optimizers['optimizer_aud_att'] = optimizer_aud_att
 
     # Load checkpoints
     if args.ft_path is not None and args.ft_path != 'None':
@@ -281,76 +232,52 @@ def create_nerf(args):
             os.listdir(os.path.join(basedir, expname))) if 'tar' in f]
 
     logger.info(f'Found ckpts:{ckpts}')
-    learned_codes_dict = None
-    AudNet_state = None
-    AudAttNet_state = None
-    optimizer_aud_state = None
-    optimizer_audatt_state = None
+
     if len(ckpts) > 0 and not args.no_reload:
         ckpt_path = ckpts[-1]
         logger.info(f'Reloading from: {ckpt_path}')
         ckpt = torch.load(ckpt_path)
-
         start = ckpt['global_step']
-        optimizer.load_state_dict(ckpt['optimizer_state_dict'])
-        AudNet_state = ckpt['network_audnet_state_dict']
-        optimizer_aud_state = ckpt['optimizer_aud_state_dict']
 
-        # Load model
-        model.load_state_dict(ckpt['network_fn_state_dict'])
-        if model_fine is not None:
-            model_fine.load_state_dict(ckpt['network_fine_state_dict'])
-        if 'network_audattnet_state_dict' in ckpt:
-            AudAttNet_state = ckpt['network_audattnet_state_dict']
-        if 'optimize_audatt_state_dict' in ckpt:
-            optimizer_audatt_state = ckpt['optimize_audatt_state_dict']
+        optimizer_nerf.load_state_dict(ckpt['optimizer_nerf_state_dict'])
+        optimizer_aud.load_state_dict(ckpt['optimizer_aud_state_dict'])
+        optimizer_aud_att.load_state_dict(ckpt['optimize_audatt_state_dict'])
+        optimizer_unet.load_state_dict(ckpt['optimizer_unet_state_dict'])
 
-    ##########################
+        aud_net.load_state_dict(ckpt['audnet_state_dict'], strict=False)
+        face_nerf_coarse.load_state_dict(ckpt['face_nerf_coarse_state_dict'])
+        face_nerf_fine.load_state_dict(ckpt['face_nerf_fine_state_dict'])
+        aud_att_net.load_state_dict(ckpt['audattnet_state_dict'], strict=False)
+        face_unet.load_state_dict(ckpt['face_unet_state_dict'])
+
+    def network_query_fn(inputs, viewdirs, aud_para, network_fn, intrinsic, cnn_features):
+        return run_network(inputs, viewdirs, aud_para, network_fn,
+                           intrisic=intrinsic,
+                           cnn_features=cnn_features,
+                           embed_fn=embed_fn,
+                           embeddirs_fn=embeddirs_fn,
+                           netchunk=args.netchunk)
 
     render_kwargs_train = {
         'network_query_fn': network_query_fn,
         'perturb': args.perturb,
         'N_importance': args.N_importance,
-        'network_fine': model_fine,
         'N_samples': args.N_samples,
-        'network_fn': model,
         'use_viewdirs': args.use_viewdirs,
         'white_bkgd': args.white_bkgd,
         'raw_noise_std': args.raw_noise_std,
     }
 
-    # NDC only good for LLFF-style forward facing data
-    if args.dataset_type != 'llff' or args.no_ndc:
-        logger.info('Not ndc!')
-        render_kwargs_train['ndc'] = False
-        render_kwargs_train['lindisp'] = args.lindisp
-
-    render_kwargs_test = {
-        k: render_kwargs_train[k] for k in render_kwargs_train}
+    render_kwargs_test = {k: render_kwargs_train[k] for k in render_kwargs_train}
     render_kwargs_test['perturb'] = False
     render_kwargs_test['raw_noise_std'] = 0.
 
-    return render_kwargs_train, render_kwargs_test, start, grad_vars, optimizer, learned_codes_dict, \
-           AudNet_state, optimizer_aud_state, AudAttNet_state, optimizer_audatt_state
+    return render_kwargs_train, render_kwargs_test, start, models, optimizers
 
 
 def raw2outputs(raw, z_vals, rays_d, bc_rgb, raw_noise_std=0, white_bkgd=False, pytest=False):
-    """Transforms model's predictions to semantically meaningful values.
-    Args:
-        raw: [num_rays, num_samples along ray, 4]. Prediction from model.
-        z_vals: [num_rays, num_samples along ray]. Integration time.
-        rays_d: [num_rays, 3]. Direction of each ray.
-    Returns:
-        rgb_map: [num_rays, 3]. Estimated RGB color of a ray.
-        disp_map: [num_rays]. Disparity map. Inverse of depth map.
-        acc_map: [num_rays]. Sum of weights along each ray.
-        weights: [num_rays, num_samples]. Weights assigned to each sampled color.
-        depth_map: [num_rays]. Estimated distance to object.
-    """
-
     def raw2alpha(raw, dists, act_fn=F.relu):
-        return 1. - \
-               torch.exp(-(act_fn(raw) + 1e-6) * dists)
+        return 1. - torch.exp(-(act_fn(raw) + 1e-6) * dists)
 
     dists = z_vals[..., 1:] - z_vals[..., :-1]
     dists = torch.cat([dists, torch.Tensor([1e10]).expand(dists[..., :1].shape).to(device)], -1)  # [N_rays, N_samples]
@@ -401,36 +328,6 @@ def render_rays(ray_batch,
                 raw_noise_std=0.,
                 verbose=False,
                 pytest=False):
-    """Volumetric rendering.
-    Args:
-      ray_batch: array of shape [batch_size, ...]. All information necessary
-        for sampling along a ray, including: ray origin, ray direction, min
-        dist, max dist, and unit-magnitude viewing direction.
-      network_fn: function. Model for predicting RGB and density at each point
-        in space.
-      network_query_fn: function used for passing queries to network_fn.
-      N_samples: int. Number of different times to sample along each ray.
-      retraw: bool. If True, include model's raw, unprocessed predictions.
-      lindisp: bool. If True, sample linearly in inverse depth rather than in depth.
-      perturb: float, 0 or 1. If non-zero, each ray is sampled at stratified
-        random points in time.
-      N_importance: int. Number of additional times to sample along each ray.
-        These samples are only passed to network_fine.
-      network_fine: "fine" network with same spec as network_fn.
-      white_bkgd: bool. If True, assume a white background.
-      raw_noise_std: ...
-      verbose: bool. If True, print more debugging info.
-    Returns:
-      rgb_map: [num_rays, 3]. Estimated RGB color of a ray. Comes from fine model.
-      disp_map: [num_rays]. Disparity map. 1 / depth.
-      acc_map: [num_rays]. Accumulated opacity along each ray. Comes from fine model.
-      raw: [num_rays, num_samples, 4]. Raw predictions from model.
-      rgb0: See rgb_map. Output for coarse model.
-      disp0: See disp_map. Output for coarse model.
-      acc0: See acc_map. Output for coarse model.
-      z_std: [num_rays]. Standard deviation of distances along ray for each
-        sample.
-    """
     N_rays = ray_batch.shape[0]
     rays_o, rays_d = ray_batch[:, 0:3], ray_batch[:, 3:6]  # [N_rays, 3] each
     viewdirs = ray_batch[:, -3:] if ray_batch.shape[-1] > 8 else None
@@ -505,18 +402,20 @@ def render_rays(ray_batch,
 
 
 def train():
-    parser = config_parser()
-    args = parser.parse_args()
-
     # Load data
-
     if args.dataset_type == 'audface':
+        logger.info(f"load landmarks from: {args.lmsdir}")
+        logger.info(f"load audio from： {args.aud_file}")
+
         if args.with_test == 1:
-            poses, auds, bc_img, hwfcxy = load_audface_data(args.datadir, args.testskip, args.test_file, args.aud_file)
+            poses, auds, bc_img, hwfcxy = load_audface_data(args.datadir, args.testskip, args.test_file, args.aud_file,
+                                                            head_nerf=True, lms_file=args.lmsdir)
             images = np.zeros(1)
         else:
-            images, poses, auds, bc_img, hwfcxy, sample_rects, mouth_rects, i_split = load_audface_data(args.datadir,
-                                                                                                        args.testskip)
+            images, poses, auds, bc_img, hwfcxy, face_rects, \
+            mouth_rects, i_split, driven_landmarks = \
+                load_audface_data(args.datadir, args.testskip, aud_file=args.aud_file,
+                                  head_nerf=True, lms_file=args.lmsdir)
         logger.info(f'Loaded audface: images_shape: {images.shape} || hwfcxy: {hwfcxy} || datadir: {args.datadir}')
         if args.with_test == 0:
             i_train, i_val = i_split
@@ -524,17 +423,14 @@ def train():
         near = args.near
         far = args.far
     else:
-        print('Unknown dataset type', args.dataset_type, 'exiting')
+        raise Exception(f'Unknown dataset type{args.dataset_type} existing')
         return
 
     # Cast intrinsics to right types
-    H, W, focal, cx, cy = hwfcxy
+    H, W, focal, cx, cy, intrinsic = hwfcxy
     H, W = int(H), int(W)
     hwf = [H, W, focal]
     hwfcxy = [H, W, focal, cx, cy]
-
-    # if args.render_test:
-    #     render_poses = np.array(poses[i_test])
 
     # Create log dir and copy the config file
     basedir = args.basedir
@@ -552,26 +448,15 @@ def train():
 
     # Create nerf model
     # 第二行是加载已保存模型的结果
-    render_kwargs_train, render_kwargs_test, start, grad_vars, optimizer, \
-    learned_codes, AudNet_state, optimizer_aud_state, AudAttNet_state, optimizer_audatt_state \
-        = create_nerf(args)
+    render_kwargs_train, render_kwargs_test, start, models, optimizers = create_model(args)
     global_step = start
 
-    AudNet = AudioNet(args.dim_aud, args.win_size).to(device)
-    AudAttNet = AudioAttNet().to(device)
-    optimizer_Aud = torch.optim.Adam(
-        params=list(AudNet.parameters()), lr=args.lrate, betas=(0.9, 0.999))
-    optimizer_AudAtt = torch.optim.Adam(
-        params=list(AudAttNet.parameters()), lr=args.lrate, betas=(0.9, 0.999))
+    aud_net = models['aud_model']
+    aud_att_net = models['aud_att_model']
+    optimizer_aud = optimizers['optimizer_aud']
+    optimizer_aud_att = optimizers['optimizer_aud_att']
+    optimizer_nerf = optimizers['optimizer_nerf']
 
-    if AudNet_state is not None:
-        AudNet.load_state_dict(AudNet_state, strict=False)
-    if optimizer_aud_state is not None:
-        optimizer_Aud.load_state_dict(optimizer_aud_state)
-    if AudAttNet_state is not None:
-        AudAttNet.load_state_dict(AudAttNet_state, strict=False)
-    if optimizer_audatt_state is not None:
-        optimizer_AudAtt.load_state_dict(optimizer_audatt_state)
     bds_dict = {
         'near': near,
         'far': far,
@@ -593,7 +478,7 @@ def train():
                 'test' if args.render_test else 'path', start))
             os.makedirs(testsavedir, exist_ok=True)
             logger.info(f'test poses shape: {poses.shape}')
-            auds_val = AudNet(auds)
+            auds_val = aud_net(auds)
             rgbs, disp, last_weight = render_path(poses, auds_val, bc_img, hwfcxy, args.chunk, render_kwargs_test,
                                                   gt_imgs=images, savedir=testsavedir, render_factor=args.render_factor)
             np.save(os.path.join(testsavedir, 'last_weight.npy'), last_weight)
@@ -603,31 +488,8 @@ def train():
 
     # Prepare raybatch tensor if batching random rays
     N_rand = args.N_rand
-    logger.info(f'N_rand: {N_rand} , no_batching: {args.no_batching}, sample_rate {args.sample_rate}')
-    use_batching = not args.no_batching
-
-    if use_batching:
-        # For random ray batching
-        logger.info('get rays')
-        rays = np.stack([get_rays_np(H, W, focal, p, cx, cy)
-                         for p in poses[:, :3, :4]], 0)  # [N, ro+rd, H, W, 3]
-        logger.info('done, concats')
-        # [N, ro+rd+rgb, H, W, 3]
-        rays_rgb = np.concatenate([rays, images[:, None]], 1)
-        # [N, H, W, ro+rd+rgb, 3]
-        rays_rgb = np.transpose(rays_rgb, [0, 2, 3, 1, 4])
-        rays_rgb = np.stack([rays_rgb[i]
-                             for i in i_train], 0)  # train images only
-        # [(N-1)*H*W, ro+rd+rgb, 3]
-        rays_rgb = np.reshape(rays_rgb, [-1, 3, 3])
-        rays_rgb = rays_rgb.astype(np.float32)
-        logger.info('shuffle rays')
-        np.random.shuffle(rays_rgb)
-
-        logger.info('done')
-        i_batch = 0
-
-        rays_rgb = torch.Tensor(rays_rgb).to(device)
+    logger.info(f'N_rand: {N_rand} , use_batching: {args.use_batching}, sample_rate {args.sample_rate}')
+    use_batching = args.use_batching
 
     N_iters = args.N_iters + 1
     logger.info('Begin')
@@ -640,27 +502,17 @@ def train():
 
         # Sample random ray batch
         if use_batching:
-            # Random over all images
-            batch = rays_rgb[i_batch:i_batch + N_rand]  # [B, 2+1, 3*?]
-            batch = torch.transpose(batch, 0, 1)
-            batch_rays, target_s = batch[:2], batch[2]
-
-            i_batch += N_rand
-            if i_batch >= rays_rgb.shape[0]:
-                logger.info("Shuffle data after an epoch!")
-                rand_idx = torch.randperm(rays_rgb.shape[0])
-                rays_rgb = rays_rgb[rand_idx]
-                i_batch = 0
-
+            pass
         else:
             # Random from one image
             img_i = np.random.choice(i_train)
             # 目标图像
-            target = torch.as_tensor(imageio.imread(images[img_i])).to(device).float() / 255.0
+            raw_img = imageio.imread(images[img_i])
+            target = torch.as_tensor(raw_img).to(device).float() / 255.0
             pose = poses[img_i, :3, :4]
-            rect = sample_rects[img_i]
-            # mouth_rect = mouth_rects[img_i]
+            rect = face_rects[img_i]
             aud = auds[img_i]
+            landmark = driven_landmarks[i]  # (68 * 2)
             if global_step >= args.nosmo_iters:
                 # args.smo_size=8
                 smo_half_win = int(args.smo_size / 2)
@@ -680,68 +532,66 @@ def train():
                 if pad_right > 0:
                     auds_win = torch.cat(
                         (auds_win, torch.zeros_like(auds_win)[:pad_right]), dim=0)
-                auds_win = AudNet(auds_win)
+                auds_win = aud_net(auds_win)
                 aud = auds_win[smo_half_win]
-                aud_smo = AudAttNet(auds_win)
+                aud_smo = aud_att_net(auds_win)
             else:
-                aud = AudNet(aud.unsqueeze(0))
+                aud = aud_net(aud.unsqueeze(0))
+
+            # 计算射线穿过的像素点位置
             if N_rand is not None:
                 rays_o, rays_d = get_rays(H, W, focal, torch.Tensor(pose).to(device), cx, cy)  # (H, W, 3), (H, W, 3)
 
                 if i < args.precrop_iters:
-                    dH = int(H // 2 * args.precrop_frac)
-                    dW = int(W // 2 * args.precrop_frac)
-                    coords = torch.stack(
-                        torch.meshgrid(
-                            torch.linspace(H // 2 - dH, H // 2 + dH - 1, 2 * dH),
-                            torch.linspace(W // 2 - dW, W // 2 + dW - 1, 2 * dW)
-                        ), -1)
-                    if i == start:
-                        logger.info(
-                            f"[Config] Center cropping of size {2 * dH} x {2 * dW} is enabled until iter {args.precrop_iters}")
+                    pass
                 else:
                     # 这里给出了选点的范围 - 整张图片
                     coords = torch.stack(
-                        torch.meshgrid(torch.linspace(0, H - 1, H), torch.linspace(0, W - 1, W)),
-                        -1)  # (H, W, 2)
+                        torch.meshgrid(torch.linspace(0, H - 1, H),
+                                       torch.linspace(0, W - 1, W)), -1)  # (H, W, 2)
 
                 coords = torch.reshape(coords, [-1, 2])  # (H * W, 2)
                 if args.sample_rate > 0:
-                    rect_inds = (coords[:, 0] >= rect[0]) & (
-                            coords[:, 0] <= rect[0] + rect[2]) & (
-                                        coords[:, 1] >= rect[1]) & (
-                                        coords[:, 1] <= rect[1] + rect[3])
-                    coords_rect = coords[rect_inds]
-                    coords_norect = coords[~rect_inds]
-                    rect_num = int(N_rand * args.sample_rate)
-                    norect_num = N_rand - rect_num
+                    # TODO: 计算人脸的关键点坐标
+                    raw_lms = np.loadtxt(os.path.join(args.datadir, 'ori_imgs', f'{img_i}.lms'))
+                    if raw_lms is None:
+                        logger.error(f"Can not detect face in {i} iter, img_index: {img_i}")
+                    lms_tensor = torch.tensor(raw_lms).long()
+
+                    # 这里是计算人脸的位置
+                    rect_inds = (coords[:, 0] >= rect[0]) & (coords[:, 0] <= rect[0] + rect[2]) \
+                                & (coords[:, 1] >= rect[1]) & (coords[:, 1] <= rect[1] + rect[3])
+
+                    coords_rect = coords[rect_inds]  # 包含人脸的像素
+                    coords_norect = coords[~rect_inds]  # 不包含人脸的像素
+
+                    """ 计算除了关键点之外的采样数量 """
+                    sample_num = N_rand - landmark.shape[0]
+                    rect_num = int(sample_num * args.sample_rate)
+                    norect_num = sample_num - rect_num
+
                     select_inds_rect = np.random.choice(
                         coords_rect.shape[0], size=[rect_num], replace=False)  # (N_rand,)
-                    # (N_rand, 2)
-                    select_coords_rect = coords_rect[select_inds_rect].long()
-                    select_inds_norect = np.random.choice(coords_norect.shape[0], size=[norect_num],
-                                                          replace=False)  # (N_rand,)
-                    # (N_rand, 2)
-                    select_coords_norect = coords_norect[select_inds_norect].long(
-                    )
-                    select_coords = torch.cat(
-                        (select_coords_rect, select_coords_norect), dim=0)
+                    select_coords_rect = coords_rect[select_inds_rect].long()  # (N_rand * sample_rate, 2)
+
+                    select_inds_norect = np.random.choice(
+                        coords_norect.shape[0], size=[norect_num], replace=False)  # (N_rand,)
+                    select_coords_norect = coords_norect[select_inds_norect].long()  # (N_rand * (1-sample_rate), 2)
+
+                    select_coords = torch.cat((lms_tensor, select_coords_rect, select_coords_norect), dim=0)
                 else:
-                    select_inds = np.random.choice(
-                        coords.shape[0], size=[N_rand], replace=False)  # (N_rand,)
-                    select_coords = coords[select_inds].long()
+                    pass
 
                 rays_o = rays_o[select_coords[:, 0],
                                 select_coords[:, 1]]  # (N_rand, 3)
                 rays_d = rays_d[select_coords[:, 0],
                                 select_coords[:, 1]]  # (N_rand, 3)
                 batch_rays = torch.stack([rays_o, rays_d], 0)
-                target_s = target[select_coords[:, 0],
-                                  select_coords[:, 1]]  # (N_rand, 3)
+                target_s = target[select_coords[:, 0], select_coords[:, 1]]  # (N_rand, 3)
                 bc_rgb = bc_img[select_coords[:, 0],
                                 select_coords[:, 1]]
 
-        #####  Core optimization loop  #####
+        """  Core optimization loop  """
         if global_step >= args.nosmo_iters:
             rgb, disp, acc, _, extras = render_dynamic_face(H, W, focal, cx, cy, chunk=args.chunk, rays=batch_rays,
                                                             aud_para=aud_smo, bc_rgb=bc_rgb,
@@ -753,52 +603,58 @@ def train():
                                                             verbose=i < 10, retraw=True,
                                                             **render_kwargs_train)
 
-        optimizer.zero_grad()
-        optimizer_Aud.zero_grad()
-        optimizer_AudAtt.zero_grad()
+        optimizer_nerf.zero_grad()
+        optimizer_aud.zero_grad()
+        optimizer_aud_att.zero_grad()
         img_loss = img2mse(rgb, target_s)
-        loss = img_loss
+        # 计算LMD
+        lms_loss = torch.mean((torch.tensor(rgb[:68]) - torch.tensor(landmark)) ** 2)
+
+        loss = img_loss + lms_loss
         psnr = mse2psnr(img_loss)
 
         if 'rgb0' in extras:
             img_loss0 = img2mse(extras['rgb0'], target_s)
             loss = loss + img_loss0
-            psnr0 = mse2psnr(img_loss0)
 
         loss.backward()
-        optimizer.step()
-        optimizer_Aud.step()
+        optimizer_nerf.step()
+        optimizer_aud.step()
         if global_step >= args.nosmo_iters:
-            optimizer_AudAtt.step()
-        # NOTE: IMPORTANT!
+            optimizer_aud_att.step()
+
         ###   update learning rate   ###
         decay_rate = 0.1
         decay_steps = args.lrate_decay * 1500
         new_lrate = args.lrate * (decay_rate ** (global_step / decay_steps))
-        for param_group in optimizer.param_groups:
+        for param_group in optimizer_nerf.param_groups:
             param_group['lr'] = new_lrate
 
-        for param_group in optimizer_Aud.param_groups:
+        for param_group in optimizer_aud.param_groups:
             param_group['lr'] = new_lrate
 
-        for param_group in optimizer_AudAtt.param_groups:
+        for param_group in optimizer_aud_att.param_groups:
             param_group['lr'] = new_lrate * 5
-        ################################
 
         dt = time.time() - time0
 
         # Rest is logging
         if i % args.i_weights == 0:
             path = os.path.join(basedir, expname, '{:06d}_head.tar'.format(i))
+            # TODO: 这里需要把新加的模型参数保存进来
             torch.save({
                 'global_step': global_step,
-                'network_fn_state_dict': render_kwargs_train['network_fn'].state_dict(),
-                'network_fine_state_dict': render_kwargs_train['network_fine'].state_dict(),
-                'network_audnet_state_dict': AudNet.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'optimizer_aud_state_dict': optimizer_Aud.state_dict(),
-                'network_audattnet_state_dict': AudAttNet.state_dict(),
-                'optimizer_audatt_state_dict': optimizer_AudAtt.state_dict(),
+
+                'face_nerf_coarse_state_dict': models['nerf_attention_model'].state_dict(),
+                'face_nerf_fine_state_dict': models['nerf_fine_attention_model'].state_dict(),
+                'audnet_state_dict': aud_net.state_dict(),
+                'audattnet_state_dict': aud_att_net.state_dict(),
+                'face_unet_state_dict': models['face_unet_model'].state_dict(),
+
+                'optimizer_nerf_state_dict': optimizer_nerf.state_dict(),
+                'optimizer_aud_state_dict': optimizer_aud.state_dict(),
+                'optimizer_audatt_state_dict': optimizer_aud_att.state_dict(),
+                'optimizer_unet_state_dict': optimizers['optimizer_unet'].state_dict(),
             }, path)
             logger.info(f'Saved checkpoints at {path}')
 
@@ -807,7 +663,7 @@ def train():
                 basedir, expname, 'testset_{:06d}'.format(i))
             os.makedirs(testsavedir, exist_ok=True)
             logger.info(f'test poses shape: {poses[i_val].shape}')
-            auds_val = AudNet(auds[i_val])
+            auds_val = aud_net(auds[i_val])
             with torch.no_grad():
                 render_path(torch.Tensor(poses[i_val]).to(device), auds_val, bc_img, hwfcxy, args.chunk,
                             render_kwargs_test, gt_imgs=None, savedir=testsavedir)

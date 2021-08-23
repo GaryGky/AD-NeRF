@@ -1,0 +1,8 @@
+/test_audio
+/pretrained_models
+.idea
+.DS_Store
+/dataset
+/data_util/face_tracking/3DMM/01_MorphableModel.mat
+/data_util/face_tracking/3DMM/3DMM_info.npy
+/data_util/deepspeech_features/__pycache__/

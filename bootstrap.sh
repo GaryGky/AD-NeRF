@@ -10,3 +10,6 @@ python ./NeRFs/HeadNeRF/run_nerf.py --config dataset/Obama/HeadNeRF_config.txt
 
 # Torso train
 python ./NeRFs/TorsoNeRF/run_nerf.py --config dataset/Obama/TorsoNeRF_config.txt
+
+# Test
+python NeRFs/TorsoNeRF/run_nerf.py --config dataset/Obama/TorsoNeRFTest_config.txt --aud_file=slow.npy --test_size=-1

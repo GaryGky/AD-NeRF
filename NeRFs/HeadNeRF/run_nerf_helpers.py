@@ -1,14 +1,14 @@
+import random
+
 import numpy as np
-import torch.nn.functional as F
-import torch.nn as nn
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
 torch.autograd.set_detect_anomaly(True)
-device = torch.device("cuda:5")
+device = torch.device("cuda:2")
 
 
-# TODO: remove this dependency
-# Misc
 def img2mse(x, y): return torch.mean((x - y) ** 2)
 
 
@@ -72,274 +72,6 @@ def get_embedder(multires, i=0):
     return embed, embedder_obj.out_dim
 
 
-# Audio feature extractor
-class AudioAttNet(nn.Module):
-    def __init__(self, dim_aud=32, seq_len=8):
-        super(AudioAttNet, self).__init__()
-        self.seq_len = seq_len
-        self.dim_aud = dim_aud
-        self.attentionConvNet = nn.Sequential(  # b x subspace_dim x seq_len
-            nn.Conv1d(self.dim_aud, 16, kernel_size=3,
-                      stride=1, padding=1, bias=True),
-            nn.LeakyReLU(0.02, True),
-            nn.Conv1d(16, 8, kernel_size=3, stride=1, padding=1, bias=True),
-            nn.LeakyReLU(0.02, True),
-            nn.Conv1d(8, 4, kernel_size=3, stride=1, padding=1, bias=True),
-            nn.LeakyReLU(0.02, True),
-            nn.Conv1d(4, 2, kernel_size=3, stride=1, padding=1, bias=True),
-            nn.LeakyReLU(0.02, True),
-            nn.Conv1d(2, 1, kernel_size=3, stride=1, padding=1, bias=True),
-            nn.LeakyReLU(0.02, True)
-        )
-        self.attentionNet = nn.Sequential(
-            nn.Linear(in_features=self.seq_len,
-                      out_features=self.seq_len, bias=True),
-            nn.Softmax(dim=1)
-        )
-
-    def forward(self, x):
-        y = x[..., :self.dim_aud].permute(1, 0).unsqueeze(
-            0)  # 2 x subspace_dim x seq_len
-        y = self.attentionConvNet(y)
-        y = self.attentionNet(y.view(1, self.seq_len)).view(self.seq_len, 1)
-        # print(y.view(-1).data)
-        return torch.sum(y * x, dim=0)
-
-
-# Model
-
-
-# Audio feature extractor
-class AudioNet(nn.Module):
-    def __init__(self, dim_aud=76, win_size=16):
-        super(AudioNet, self).__init__()
-        self.win_size = win_size
-        self.dim_aud = dim_aud
-        self.encoder_conv = nn.Sequential(  # n x 29 x 16
-            nn.Conv1d(29, 32, kernel_size=3, stride=2, padding=1, bias=True),  # n x 32 x 8
-            nn.LeakyReLU(0.02, True),
-            nn.Conv1d(32, 32, kernel_size=3, stride=2, padding=1, bias=True),  # n x 32 x 4
-            nn.LeakyReLU(0.02, True),
-            nn.Conv1d(32, 64, kernel_size=3, stride=2, padding=1, bias=True),  # n x 64 x 2
-            nn.LeakyReLU(0.02, True),
-            nn.Conv1d(64, 64, kernel_size=3, stride=2, padding=1, bias=True),  # n x 64 x 1
-            nn.LeakyReLU(0.02, True),
-        )
-        self.encoder_fc1 = nn.Sequential(
-            nn.Linear(64, 64),
-            nn.LeakyReLU(0.02, True),
-            nn.Linear(64, dim_aud),
-        )
-
-    def forward(self, x):
-        half_w = int(self.win_size / 2)
-        x = x[:, 8 - half_w:8 + half_w, :].permute(0, 2, 1)
-        x = self.encoder_conv(x).squeeze(-1)
-        x = self.encoder_fc1(x).squeeze()
-        return x
-
-
-# Model
-
-
-class FaceNeRF(nn.Module):
-    def __init__(self, D=8, W=256, input_ch=3, input_ch_views=3, dim_aud=76,
-                 output_ch=4, skips=[4], use_viewdirs=False):
-        """ 
-        """
-        super(FaceNeRF, self).__init__()
-        self.D = D
-        self.W = W
-        self.input_ch = input_ch
-        self.input_ch_views = input_ch_views
-        self.dim_aud = dim_aud
-        self.skips = skips
-        self.use_viewdirs = use_viewdirs
-
-        input_ch_all = input_ch + dim_aud
-        self.pts_linears = nn.ModuleList(
-            [nn.Linear(input_ch_all, W)] + [nn.Linear(W, W) if i not in self.skips else nn.Linear(W + input_ch_all, W)
-                                            for i in range(D - 1)])
-
-        # Implementation according to the official code release (https://github.com/bmild/nerf/blob/master/run_nerf_helpers.py#L104-L105)
-        # self.views_linears = nn.ModuleList(
-        #     [nn.Linear(input_ch_views + W, W//2)])
-
-        # Implementation according to the paper
-        self.views_linears = nn.ModuleList(
-            [nn.Linear(input_ch_views + W, W // 2)] + [nn.Linear(W // 2, W // 2) for i in range(D // 4)])
-
-        if use_viewdirs:
-            self.feature_linear = nn.Linear(W, W)
-            self.alpha_linear = nn.Linear(W, 1)
-            self.rgb_linear = nn.Linear(W // 2, 3)
-        else:
-            self.output_linear = nn.Linear(W, output_ch)
-
-    def forward(self, x):
-        input_pts, input_views = torch.split(
-            x, [self.input_ch + self.dim_aud, self.input_ch_views], dim=-1)
-        h = input_pts
-        for i, l in enumerate(self.pts_linears):
-            h = self.pts_linears[i](h)
-            h = F.relu(h)
-            if i in self.skips:
-                h = torch.cat([input_pts, h], -1)
-
-        if self.use_viewdirs:
-            alpha = self.alpha_linear(h)
-            feature = h  # self.feature_linear(h)
-            h = torch.cat([feature, input_views], -1)
-
-            for i, l in enumerate(self.views_linears):
-                h = self.views_linears[i](h)
-                h = F.relu(h)
-
-            rgb = self.rgb_linear(h)
-            outputs = torch.cat([rgb, alpha], -1)
-        else:
-            outputs = self.output_linear(h)
-
-        return outputs
-
-    def load_weights_from_keras(self, weights):
-        assert self.use_viewdirs, "Not implemented if use_viewdirs=False"
-
-        # Load pts_linears
-        for i in range(self.D):
-            idx_pts_linears = 2 * i
-            self.pts_linears[i].weight.data = torch.from_numpy(
-                np.transpose(weights[idx_pts_linears]))
-            self.pts_linears[i].bias.data = torch.from_numpy(
-                np.transpose(weights[idx_pts_linears + 1]))
-
-        # Load feature_linear
-        idx_feature_linear = 2 * self.D
-        self.feature_linear.weight.data = torch.from_numpy(
-            np.transpose(weights[idx_feature_linear]))
-        self.feature_linear.bias.data = torch.from_numpy(
-            np.transpose(weights[idx_feature_linear + 1]))
-
-        # Load views_linears
-        idx_views_linears = 2 * self.D + 2
-        self.views_linears[0].weight.data = torch.from_numpy(
-            np.transpose(weights[idx_views_linears]))
-        self.views_linears[0].bias.data = torch.from_numpy(
-            np.transpose(weights[idx_views_linears + 1]))
-
-        # Load rgb_linear
-        idx_rbg_linear = 2 * self.D + 4
-        self.rgb_linear.weight.data = torch.from_numpy(
-            np.transpose(weights[idx_rbg_linear]))
-        self.rgb_linear.bias.data = torch.from_numpy(
-            np.transpose(weights[idx_rbg_linear + 1]))
-
-        # Load alpha_linear
-        idx_alpha_linear = 2 * self.D + 6
-        self.alpha_linear.weight.data = torch.from_numpy(
-            np.transpose(weights[idx_alpha_linear]))
-        self.alpha_linear.bias.data = torch.from_numpy(
-            np.transpose(weights[idx_alpha_linear + 1]))
-
-
-# Model
-class NeRF(nn.Module):
-    def __init__(self, D=8, W=256, input_ch=3, input_ch_views=3, output_ch=4, skips=[4], use_viewdirs=False):
-        """ 
-        """
-        super(NeRF, self).__init__()
-        self.D = D
-        self.W = W
-        self.input_ch = input_ch
-        self.input_ch_views = input_ch_views
-        self.skips = skips
-        self.use_viewdirs = use_viewdirs
-
-        self.pts_linears = nn.ModuleList(
-            [nn.Linear(input_ch, W)] + [nn.Linear(W, W) if i not in self.skips else nn.Linear(W + input_ch, W) for i in
-                                        range(D - 1)])
-
-        # Implementation according to the official code release (https://github.com/bmild/nerf/blob/master/run_nerf_helpers.py#L104-L105)
-        self.views_linears = nn.ModuleList(
-            [nn.Linear(input_ch_views + W, W // 2)])
-
-        # Implementation according to the paper
-        # self.views_linears = nn.ModuleList(
-        #     [nn.Linear(input_ch_views + W, W//2)] + [nn.Linear(W//2, W//2) for i in range(D//2)])
-
-        if use_viewdirs:
-            self.feature_linear = nn.Linear(W, W)
-            self.alpha_linear = nn.Linear(W, 1)
-            self.rgb_linear = nn.Linear(W // 2, 3)
-        else:
-            self.output_linear = nn.Linear(W, output_ch)
-
-    def forward(self, x):
-        input_pts, input_views = torch.split(
-            x, [self.input_ch, self.input_ch_views], dim=-1)
-        h = input_pts
-        for i, l in enumerate(self.pts_linears):
-            h = self.pts_linears[i](h)
-            h = F.relu(h)
-            if i in self.skips:
-                h = torch.cat([input_pts, h], -1)
-
-        if self.use_viewdirs:
-            alpha = self.alpha_linear(h)
-            feature = self.feature_linear(h)
-            h = torch.cat([feature, input_views], -1)
-
-            for i, l in enumerate(self.views_linears):
-                h = self.views_linears[i](h)
-                h = F.relu(h)
-
-            rgb = self.rgb_linear(h)
-            outputs = torch.cat([rgb, alpha], -1)
-        else:
-            outputs = self.output_linear(h)
-
-        return outputs
-
-    def load_weights_from_keras(self, weights):
-        assert self.use_viewdirs, "Not implemented if use_viewdirs=False"
-
-        # Load pts_linears
-        for i in range(self.D):
-            idx_pts_linears = 2 * i
-            self.pts_linears[i].weight.data = torch.from_numpy(
-                np.transpose(weights[idx_pts_linears]))
-            self.pts_linears[i].bias.data = torch.from_numpy(
-                np.transpose(weights[idx_pts_linears + 1]))
-
-        # Load feature_linear
-        idx_feature_linear = 2 * self.D
-        self.feature_linear.weight.data = torch.from_numpy(
-            np.transpose(weights[idx_feature_linear]))
-        self.feature_linear.bias.data = torch.from_numpy(
-            np.transpose(weights[idx_feature_linear + 1]))
-
-        # Load views_linears
-        idx_views_linears = 2 * self.D + 2
-        self.views_linears[0].weight.data = torch.from_numpy(
-            np.transpose(weights[idx_views_linears]))
-        self.views_linears[0].bias.data = torch.from_numpy(
-            np.transpose(weights[idx_views_linears + 1]))
-
-        # Load rgb_linear
-        idx_rbg_linear = 2 * self.D + 4
-        self.rgb_linear.weight.data = torch.from_numpy(
-            np.transpose(weights[idx_rbg_linear]))
-        self.rgb_linear.bias.data = torch.from_numpy(
-            np.transpose(weights[idx_rbg_linear + 1]))
-
-        # Load alpha_linear
-        idx_alpha_linear = 2 * self.D + 6
-        self.alpha_linear.weight.data = torch.from_numpy(
-            np.transpose(weights[idx_alpha_linear]))
-        self.alpha_linear.bias.data = torch.from_numpy(
-            np.transpose(weights[idx_alpha_linear + 1]))
-
-
 # Ray helpers
 def get_rays(H, W, focal, c2w, cx=None, cy=None):
     # pytorch's meshgrid has indexing='ij'
@@ -357,22 +89,6 @@ def get_rays(H, W, focal, c2w, cx=None, cy=None):
     rays_d = torch.sum(dirs[..., np.newaxis, :] * c2w[:3, :3], -1)
     # Translate camera frame's origin to the world frame. It is the origin of all rays.
     rays_o = c2w[:3, -1].expand(rays_d.shape)
-    return rays_o, rays_d
-
-
-def get_rays_np(H, W, focal, c2w, cx=None, cy=None):
-    if cx is None:
-        cx = W * .5
-    if cy is None:
-        cy = H * .5
-    i, j = np.meshgrid(np.arange(W, dtype=np.float32),
-                       np.arange(H, dtype=np.float32), indexing='xy')
-    dirs = np.stack([(i - cx) / focal, -(j - cy) / focal, -np.ones_like(i)], -1)
-    # Rotate ray directions from camera frame to the world frame
-    # dot product, equals to: [c2w.dot(dir) for dir in dirs]
-    rays_d = np.sum(dirs[..., np.newaxis, :] * c2w[:3, :3], -1)
-    # Translate camera frame's origin to the world frame. It is the origin of all rays.
-    rays_o = np.broadcast_to(c2w[:3, -1], np.shape(rays_d))
     return rays_o, rays_d
 
 
@@ -398,38 +114,7 @@ def ndc_rays(H, W, focal, near, rays_o, rays_d):
     return rays_o, rays_d
 
 
-def cal_lap_loss(tensor_list, weight_list):
-    lap_kernel = torch.Tensor(
-        (-0.5, 1.0, -0.5)).unsqueeze(0).unsqueeze(0).float().to(tensor_list[0].device)
-    loss_lap = 0
-    for i in range(len(tensor_list)):
-        in_tensor = tensor_list[i]
-        in_tensor = in_tensor.view(-1, 1, in_tensor.shape[-1])
-        out_tensor = F.conv1d(in_tensor, lap_kernel)
-        loss_lap += torch.mean(out_tensor ** 2) * weight_list[i]
-    return loss_lap
-
-
-def DCTBasis(k, N):
-    assert (k < N)
-    basis = torch.tensor([np.pi * (float(n) + 0.5) * k / float(N)
-                          for n in range(N)]).float()
-    basis = torch.cos(basis) * (1. / np.sqrt(float(N))
-                                if k == 0 else np.sqrt(2. / float(N)))
-    return basis
-
-
-def DCTNullSpace(k, N):
-    return torch.stack([DCTBasis(ind, N) for ind in range(k, N)])
-
-
-def DCTSpace(k, N):
-    return torch.stack([DCTBasis(ind, N) for ind in range(0, k)])
-
-
 # Hierarchical sampling (section 5.2)
-
-
 def sample_pdf(bins, weights, N_samples, det=False, pytest=False):
     # Get pdf
     weights = weights + 1e-5  # prevent nans
@@ -486,8 +171,9 @@ def config_parser():
                         help='experiment name')
     parser.add_argument("--basedir", type=str, default='./logs/',
                         help='where to store ckpts and logs')
-    parser.add_argument("--datadir", type=str, default='./data/llff/fern',
-                        help='input data directory')
+    parser.add_argument("--datadir", type=str, default='./dataset/Obama', help='input data directory')
+    parser.add_argument("--lmsdir", type=str, default='./dataset/xidada/ori_imgs', help='input landmarks directory')
+    parser.add_argument("--gpu", type=int, default=2, help='select gpu to use')
 
     # training options
     parser.add_argument("--netdepth", type=int, default=8,
@@ -508,7 +194,7 @@ def config_parser():
                         help='number of rays processed in parallel, decrease if running out of memory')
     parser.add_argument("--netchunk", type=int, default=1024 * 64,
                         help='number of pts sent through network in parallel, decrease if running out of memory')
-    parser.add_argument("--no_batching", action='store_false',
+    parser.add_argument("-use_batching", action='store_false', default=False,
                         help='only take random rays from 1 image at a time')
     parser.add_argument("--no_reload", action='store_true',
                         help='do not reload weights from saved ckpt')
@@ -577,7 +263,7 @@ def config_parser():
                         help="far sampling plane")
     parser.add_argument("--test_file", type=str, default='transforms_test.json',
                         help='test file')
-    parser.add_argument("--aud_file", type=str, default='aud.npy',
+    parser.add_argument("--aud_file", type=str, default='xidada.npy',
                         help='test audio deepspeech file')
     parser.add_argument("--win_size", type=int, default=16,
                         help="windows size of audio feature")
@@ -586,7 +272,7 @@ def config_parser():
     parser.add_argument('--nosmo_iters', type=int, default=300000,
                         help='number of iterations befor applying smoothing on audio features')
 
-    # llff flags
+    #
     parser.add_argument("--factor", type=int, default=8,
                         help='downsample factor for LLFF images')
     parser.add_argument("--no_ndc", action='store_true',
@@ -611,3 +297,50 @@ def config_parser():
                         help='frequency of render_poses video saving')
 
     return parser
+
+
+# Inverts a pose or extrinsic matrix
+def invert(mat):
+    rot = mat[..., :3, :3]
+    trans = mat[..., :3, 3, None]
+    rot_t = torch.transpose(rot, [0, 2, 1])
+    trans_t = torch.matmul(-1 * torch.transpose(rot, [0, 2, 1]), trans)
+    return torch.cat([rot_t, trans_t], -1)
+
+
+def make_indices(pts, attention_poses, intrinsic, H, W):
+    hom_points = torch.cat([pts, torch.broadcast_to([1.0], pts.shape[:-1] + (1,))], -1)
+    extrinsic = invert(attention_poses)[:, :3]
+    focal = intrinsic[0, 0]
+
+    hom_points = torch.broadcast_to(hom_points[None, ...],
+                                    (extrinsic.shape[0], hom_points.shape[0], hom_points.shape[1]))
+
+    pt_camera = torch.matmul(hom_points, torch.transpose(extrinsic, [0, 2, 1]))
+
+    pt_camera = focal / pt_camera[:, :, 2][..., None] * pt_camera
+
+    final = 1.0 / focal * (pt_camera @ torch.transpose(intrinsic))
+    final = torch.flip(final, dims=[2])[..., 1:]
+    final = (torch.tensor([0., W]) - final) * torch.tensor([-1., 1.])
+    final = torch.round(final)
+    final = torch.maximum(torch.minimum(final, [H - 1., W - 1.]), 0)
+    final = final.type(torch.int32)
+
+    return final
+
+
+def gather_indices(pts, attention_poses, intrinsic, images_features):
+    H, W = images_features.shape[1:3]
+    H = int(H)
+    W = int(W)
+    indices = make_indices(pts, attention_poses, intrinsic, H, W)
+    # TODO：从images_features中选出下标为indices的点
+    features = images_features[:, indices]
+    return torch.cat([features, indices.type(torch.float32)], -1)
+
+
+if __name__ == '__main__':
+    attention_embed_func, attention_embed_out_dim = get_embedder(5, 0)
+    print(attention_embed_func)
+    print(attention_embed_out_dim)
